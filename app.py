@@ -25,7 +25,7 @@ import streamlit as st
 if "GOOGLE_PLACES_API_KEY" in st.secrets:
     os.environ["GOOGLE_PLACES_API_KEY"] = st.secrets["GOOGLE_PLACES_API_KEY"]
 
-from scraper import GooglePlacesScraper
+from scraper import GooglePlacesScraper, enrich_with_emails
 
 # ── Configuration de la page ───────────────────────────────────────────────────
 
@@ -225,6 +225,17 @@ with st.sidebar:
                 "⚠️ Ralentit la recherche et augmente la consommation de quota API."
             ),
         )
+        scrape_emails = st.toggle(
+            "🔎 Chercher les emails sur les sites web",
+            value=False,
+            help=(
+                "Visite le site web de chaque entreprise pour y trouver une adresse email publique.\n\n"
+                "• Analyse la page principale + pages /contact\n"
+                "• Priorise les balises mailto:\n"
+                "• ⚠️ Ajoute ~1-2s de traitement par résultat\n"
+                "• Certains sites bloquent les bots (résultat vide dans ce cas)"
+            ),
+        )
 
     st.divider()
     st.caption(
@@ -324,6 +335,18 @@ if search_clicked:
                 places, language=language, progress_callback=update_progress
             )
 
+    # ── Scraping des emails sur les sites web ──────────────────────────────────
+    if scrape_emails:
+        sites_count = sum(1 for p in places if p.get("websiteUri"))
+        progress_bar.progress(0, text=f"Recherche d'emails sur {sites_count} sites…")
+
+        def update_email_progress(current: int, total: int) -> None:
+            pct = int(current / total * 100)
+            progress_bar.progress(pct, text=f"Analyse des sites {current}/{total}…")
+
+        with st.spinner("Extraction des emails en cours…"):
+            places = enrich_with_emails(places, progress_callback=update_email_progress)
+
     progress_bar.empty()
 
     # Mise en cache des résultats dans la session pour persistance
@@ -369,6 +392,12 @@ if "results" in st.session_state:
         with_website = df["site_web"].replace("", pd.NA).dropna()
         col4.metric("🌐 Avec site web", len(with_website))
 
+    if not df.empty and "email" in df.columns:
+        with_email = df["email"].replace("", pd.NA).dropna()
+        if len(with_email) > 0:
+            col1, col2 = st.columns([1, 3])
+            col1.metric("📧 Avec email", len(with_email))
+
     st.divider()
 
     # ── Tableau des résultats ──────────────────────────────────────────────────
@@ -378,6 +407,7 @@ if "results" in st.session_state:
             "nom": st.column_config.TextColumn("Nom", width="medium"),
             "adresse": st.column_config.TextColumn("Adresse", width="large"),
             "telephone": st.column_config.TextColumn("Téléphone", width="small"),
+            "email": st.column_config.TextColumn("Email", width="medium"),
             "site_web": st.column_config.LinkColumn(
                 "Site Web",
                 width="medium",

@@ -2,6 +2,8 @@
 # Installation : pip install -r requirements.txt
 
 streamlit>=1.32.0      # Interface web
-requests>=2.31.0       # Appels HTTP vers l'API Google Places
+requests>=2.31.0       # Appels HTTP vers l'API Google Places et les sites web
 python-dotenv>=1.0.0   # Chargement de la clé API depuis .env
 pandas>=2.0.0          # Manipulation des données et affichage dans Streamlit
+beautifulsoup4>=4.12.0 # Parsing HTML pour l'extraction d'emails
+lxml>=5.0.0            # Parser HTML rapide pour BeautifulSoup

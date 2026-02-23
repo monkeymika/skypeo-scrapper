@@ -12,10 +12,13 @@ Documentation officielle :
 import csv
 import io
 import os
+import re
 import time
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # Chargement de la clé API depuis le fichier .env
@@ -58,12 +61,164 @@ CSV_COLUMNS = [
     "nom",
     "adresse",
     "telephone",
+    "email",
     "site_web",
     "note_google",
     "nombre_avis",
     "statut",
     "types",
 ]
+
+# ── Scraping d'emails ─────────────────────────────────────────────────────────
+
+# Regex standard pour détecter les adresses email dans du HTML brut
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+# Préfixes locaux génériques à déprioritiser (pas à exclure complètement)
+_GENERIC_PREFIXES = {
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "postmaster", "mailer-daemon", "bounce", "webmaster",
+}
+
+# Domaines techniques/système à exclure totalement
+_DOMAIN_BLACKLIST = {
+    "sentry.io", "example.com", "test.com", "wixpress.com",
+    "amazonaws.com", "cloudflare.com", "google.com",
+    "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
+    "2x.png", "3x.png",  # artefacts regex sur les images retina
+}
+
+# Extensions qui ne sont jamais des emails (artefacts regex)
+_FAKE_TLDS = {".png", ".jpg", ".gif", ".svg", ".js", ".css", ".woff", ".ttf"}
+
+# Pages de contact courantes à sonder si la page principale est vide
+_CONTACT_PATHS = [
+    "/contact", "/contact-us", "/nous-contacter",
+    "/contactez-nous", "/about", "/a-propos",
+]
+
+# En-tête HTTP pour éviter les blocages basiques (User-Agent navigateur)
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+}
+
+
+def _is_valid_email(email: str) -> bool:
+    """Retourne True si l'email semble légitime (ni système, ni artefact regex)."""
+    email = email.lower().strip()
+    if "@" not in email:
+        return False
+    local, domain = email.rsplit("@", 1)
+    # Exclure les faux domaines issus d'images/scripts
+    if any(domain.endswith(ext) for ext in _FAKE_TLDS):
+        return False
+    # Exclure les domaines techniques connus
+    if any(bl in domain for bl in _DOMAIN_BLACKLIST):
+        return False
+    # Le domaine doit contenir un point (TLD réel)
+    if "." not in domain:
+        return False
+    return True
+
+
+def _email_priority(email: str) -> int:
+    """Score de priorité : 0 = email métier spécifique (meilleur), 1 = générique."""
+    local = email.split("@")[0].lower()
+    return 1 if any(g in local for g in _GENERIC_PREFIXES) else 0
+
+
+def scrape_email_from_website(url: str, timeout: int = 8) -> str:
+    """
+    Cherche une adresse email publique sur le site web d'un établissement.
+
+    Stratégie :
+      1. Visite la page principale (url)
+      2. Si aucun email trouvé, sonde les pages de contact courantes
+      3. Priorise les emails via balise <a href="mailto:"> (plus fiables)
+      4. Fallback sur regex dans le HTML brut
+      5. Retourne le meilleur email ou "" si rien trouvé
+
+    Args:
+        url     : URL du site web (doit commencer par http/https)
+        timeout : Délai max par requête en secondes
+
+    Returns:
+        Adresse email (str) ou chaîne vide.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    pages = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
+
+    for page_url in pages:
+        try:
+            resp = requests.get(
+                page_url,
+                headers=_BROWSER_HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            if "text/html" not in resp.headers.get("Content-Type", ""):
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            found: set[str] = set()
+
+            # ── Priorité 1 : balises <a href="mailto:..."> ────────────────────
+            for tag in soup.find_all("a", href=True):
+                href = tag["href"]
+                if href.lower().startswith("mailto:"):
+                    email = href[7:].split("?")[0].strip().lower()
+                    if _is_valid_email(email):
+                        found.add(email)
+
+            # ── Priorité 2 : regex sur le texte HTML brut ─────────────────────
+            for email in _EMAIL_RE.findall(resp.text):
+                if _is_valid_email(email.lower()):
+                    found.add(email.lower())
+
+            if found:
+                # Retourne le meilleur (email métier > générique)
+                return sorted(found, key=_email_priority)[0]
+
+        except requests.RequestException:
+            # Timeout, SSL error, connexion refusée… on passe à la page suivante
+            continue
+
+    return ""
+
+
+def enrich_with_emails(
+    places: list[dict],
+    progress_callback=None,
+) -> list[dict]:
+    """
+    Ajoute le champ "email" à chaque lieu en visitant son site web.
+
+    Args:
+        places            : Liste de lieux (doivent avoir "websiteUri")
+        progress_callback : Fonction(current, total) appelée à chaque étape
+
+    Returns:
+        Liste enrichie (modification en place).
+    """
+    total = len(places)
+    for i, place in enumerate(places):
+        website = place.get("websiteUri", "")
+        place["email"] = scrape_email_from_website(website)
+        if progress_callback:
+            progress_callback(i + 1, total)
+        time.sleep(0.2)  # Pause courtoise entre les requêtes
+    return places
 
 
 # ── Classe principale ─────────────────────────────────────────────────────────
@@ -278,6 +433,7 @@ class GooglePlacesScraper:
                 "nom":          place.get("displayName", {}).get("text", ""),
                 "adresse":      place.get("formattedAddress", ""),
                 "telephone":    phone,
+                "email":        place.get("email", ""),
                 "site_web":     place.get("websiteUri", ""),
                 "note_google":  place.get("rating", ""),
                 "nombre_avis":  place.get("userRatingCount", ""),
