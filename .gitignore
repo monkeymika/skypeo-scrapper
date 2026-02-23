@@ -1,0 +1,16 @@
+# Sécurité — ne jamais versionner la clé API
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Exports
+*.csv
+
+# Streamlit — ne jamais versionner les secrets
+.streamlit/secrets.toml

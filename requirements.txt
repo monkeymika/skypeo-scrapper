@@ -1,0 +1,7 @@
+# Dépendances du scraper Google Places
+# Installation : pip install -r requirements.txt
+
+streamlit>=1.32.0      # Interface web
+requests>=2.31.0       # Appels HTTP vers l'API Google Places
+python-dotenv>=1.0.0   # Chargement de la clé API depuis .env
+pandas>=2.0.0          # Manipulation des données et affichage dans Streamlit
