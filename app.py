@@ -37,116 +37,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Thème clair / sombre ───────────────────────────────────────────────────────
-
-DARK_CSS = """
-<style>
-/* Fond principal */
-.stApp, [data-testid="stAppViewContainer"] {
-    background-color: #0e1117 !important;
-    color: #fafafa !important;
-}
-/* Sidebar */
-[data-testid="stSidebar"], [data-testid="stSidebarContent"] {
-    background-color: #1a1c24 !important;
-}
-/* Header / toolbar */
-[data-testid="stHeader"], [data-testid="stToolbar"] {
-    background-color: #0e1117 !important;
-}
-/* Inputs */
-input, textarea, select,
-[data-testid="stTextInput"] input,
-[data-testid="stTextArea"] textarea {
-    background-color: #262730 !important;
-    color: #fafafa !important;
-    border-color: #3d3f4f !important;
-}
-/* Labels et textes */
-label, p, h1, h2, h3, h4, span,
-.stMarkdown, .stCaption {
-    color: #fafafa !important;
-}
-/* Métriques */
-[data-testid="metric-container"] {
-    background-color: #1a1c24 !important;
-    border: 1px solid #2d2f3d !important;
-    border-radius: 10px;
-    padding: 12px;
-}
-/* Dividers */
-hr { border-color: #2d2f3d !important; }
-/* Expander */
-[data-testid="stExpander"] {
-    background-color: #1a1c24 !important;
-    border-color: #2d2f3d !important;
-}
-/* Dataframe */
-[data-testid="stDataFrame"] {
-    background-color: #1a1c24 !important;
-}
-/* Sliders */
-[data-testid="stSlider"] [role="slider"] {
-    background-color: #ff4b4b !important;
-}
-/* Info / Warning / Error boxes */
-[data-testid="stAlert"] {
-    background-color: #1a1c24 !important;
-}
-/* Selectbox */
-[data-testid="stSelectbox"] > div > div {
-    background-color: #262730 !important;
-    color: #fafafa !important;
-}
-</style>
-"""
-
-LIGHT_CSS = """
-<style>
-.stApp, [data-testid="stAppViewContainer"] {
-    background-color: #ffffff !important;
-    color: #31333f !important;
-}
-[data-testid="stSidebar"], [data-testid="stSidebarContent"] {
-    background-color: #f0f2f6 !important;
-}
-[data-testid="stHeader"] { background-color: #ffffff !important; }
-input, textarea { background-color: #ffffff !important; color: #31333f !important; }
-label, p, h1, h2, h3, h4, span { color: #31333f !important; }
-[data-testid="metric-container"] {
-    background-color: #f0f2f6 !important;
-    border: 1px solid #e0e0e0 !important;
-    border-radius: 10px;
-    padding: 12px;
-}
-hr { border-color: #e0e0e0 !important; }
-</style>
-"""
-
-# Initialisation de la préférence de thème (dark par défaut)
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = True
-
-# Injection CSS selon le thème courant
-st.markdown(DARK_CSS if st.session_state.dark_mode else LIGHT_CSS, unsafe_allow_html=True)
 
 # ── En-tête ────────────────────────────────────────────────────────────────────
 
 st.title("🔍 Recherche d'Entreprises Locales")
 st.caption("Propulsé par **Google Places API (New)** · Text Search + Place Details")
 st.divider()
-
-# ── Sidebar : thème ────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    dark = st.toggle(
-        "🌙 Mode sombre",
-        value=st.session_state.dark_mode,
-        key="theme_toggle",
-    )
-    if dark != st.session_state.dark_mode:
-        st.session_state.dark_mode = dark
-        st.rerun()
 
 # ── Onglets principaux ─────────────────────────────────────────────────────────
 
