@@ -504,7 +504,7 @@ with tab_massive:
     st.divider()
 
     # ── Récupération du collecteur en cours (si existant) ──────────────────────
-    collector: MassiveCollector | None = st.session_state.get("massive_collector")
+    collector = st.session_state.get("massive_collector")
 
     # ── Configuration ──────────────────────────────────────────────────────────
     is_running = collector is not None and collector.is_running

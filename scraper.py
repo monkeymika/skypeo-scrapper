@@ -9,6 +9,8 @@ Documentation officielle :
   https://developers.google.com/maps/documentation/places/web-service/text-search
 """
 
+from __future__ import annotations  # annotations lazy → compatible Python 3.7+
+
 import concurrent.futures
 import csv
 import io
