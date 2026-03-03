@@ -96,6 +96,16 @@ SECTORS = {
         "icon": "💆",
         "types": ["beauty_salon", "spa", "hair_care", "hair_salon", "nail_salon"],
     },
+    "hotellerie": {
+        "label": "Hôtellerie",
+        "icon": "🏨",
+        "types": ["hotel", "motel", "lodging", "bed_and_breakfast", "resort_hotel"],
+    },
+    "sport": {
+        "label": "Sport & Fitness",
+        "icon": "🏋️",
+        "types": ["gym", "fitness_center", "sports_club", "sports_complex", "swimming_pool"],
+    },
 }
 
 # Domaines de messagerie gratuite à exclure de la collecte massive
