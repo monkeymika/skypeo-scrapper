@@ -16,8 +16,10 @@ import csv
 import io
 import os
 import re
+import smtplib
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -26,6 +28,12 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+try:
+    import dns.resolver as _dns_resolver
+    _DNS_OK = True
+except ImportError:
+    _DNS_OK = False
 
 # Chargement de la clé API depuis le fichier .env
 load_dotenv()
@@ -864,6 +872,10 @@ _DOMAIN_BLACKLIST = {
     "amazonaws.com", "cloudflare.com", "google.com",
     "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
     "2x.png", "3x.png",  # artefacts regex sur les images retina
+    "squarespace.com", "shopify.com", "wordpress.com", "wix.com",
+    "mailchimp.com", "mailjet.com", "sendinblue.com", "brevo.com",
+    "w3.org", "schema.org", "googleapis.com", "gstatic.com",
+    "pixel.facebook.com", "doubleclick.net", "googlesyndication.com",
 }
 
 # Extensions qui ne sont jamais des emails (artefacts regex)
@@ -871,8 +883,19 @@ _FAKE_TLDS = {".png", ".jpg", ".gif", ".svg", ".js", ".css", ".woff", ".ttf"}
 
 # Pages de contact courantes à sonder si la page principale est vide
 _CONTACT_PATHS = [
-    "/contact", "/contact-us", "/nous-contacter",
-    "/contactez-nous", "/about", "/a-propos", "/mentions-legales",
+    # Contact direct
+    "/contact", "/contact/", "/contact.html", "/contact.php",
+    "/contact-us", "/contactus", "/nous-contacter", "/contactez-nous",
+    # Mentions légales (obligatoires en France → email souvent présent)
+    "/mentions-legales", "/mentions_legales", "/mentions-legales.html",
+    "/mentions-legales.php", "/mentions-légales", "/ml", "/legal",
+    # À propos / équipe
+    "/a-propos", "/a-propos.html", "/about", "/about-us", "/about.html",
+    "/qui-sommes-nous", "/equipe", "/team",
+    # Pages spécifiques aux secteurs visés
+    "/reservation", "/reservations", "/book", "/booking",
+    "/informations", "/coordonnees", "/coordonnées", "/infos",
+    "/footer", "/sitemap",
 ]
 
 # En-tête HTTP pour éviter les blocages basiques (User-Agent navigateur)
@@ -921,6 +944,99 @@ def _email_priority(email: str) -> int:
     return 1 if any(g in local for g in _GENERIC_PREFIXES) else 0
 
 
+# ── SMTP email guessing ───────────────────────────────────────────────────────
+
+# Patterns génériques testés en priorité sur le domaine de l'entreprise
+_SMTP_PATTERNS = [
+    "contact", "info", "bonjour", "hello", "accueil",
+    "direction", "gerant", "manager", "admin",
+    "reservation", "reservations", "booking",
+    "restaurant", "resto", "salon", "spa",
+    "pro", "pro2",
+]
+
+
+def _normalize(text: str) -> str:
+    """Supprime les accents et met en minuscules."""
+    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode().lower()
+
+
+def _get_mx_host(domain: str, timeout: int = 5) -> str:
+    """Retourne l'hôte MX prioritaire du domaine, ou '' si introuvable."""
+    if not _DNS_OK:
+        return ""
+    try:
+        records = _dns_resolver.resolve(domain, "MX", lifetime=timeout)
+        best = min(records, key=lambda r: r.preference)
+        return str(best.exchange).rstrip(".")
+    except Exception:
+        return ""
+
+
+def _smtp_exists(email: str, mx_host: str, timeout: int = 5) -> bool:
+    """
+    Vérifie si une boîte mail existe via SMTP (RCPT TO) sans envoyer de message.
+    Retourne True si le serveur répond 250, False sinon.
+    """
+    try:
+        with smtplib.SMTP(mx_host, 25, timeout=timeout) as smtp:
+            smtp.ehlo("mail.verify.com")
+            smtp.mail("check@mail.verify.com")
+            code, _ = smtp.rcpt(email)
+            smtp.quit()
+            return code == 250
+    except Exception:
+        return False
+
+
+def find_email_by_smtp(
+    domain: str,
+    prenom: str = "",
+    nom: str = "",
+    timeout: int = 5,
+) -> str:
+    """
+    Tente de trouver un email valide sur un domaine via SMTP pattern guessing.
+
+    Stratégie :
+      1. Récupère le MX record du domaine
+      2. Teste les patterns génériques courants (contact@, info@, accueil@…)
+      3. Si prénom/nom fournis, teste aussi les patterns nominatifs
+      4. Retourne le premier email confirmé ou "" si aucun
+
+    Args:
+        domain  : domaine de l'entreprise (ex: "restaurant-dupont.fr")
+        prenom  : prénom du dirigeant (optionnel)
+        nom     : nom du dirigeant (optionnel)
+        timeout : délai SMTP en secondes
+
+    Returns:
+        Adresse email vérifiée (str) ou chaîne vide.
+    """
+    mx = _get_mx_host(domain, timeout)
+    if not mx:
+        return ""
+
+    candidates = [f"{p}@{domain}" for p in _SMTP_PATTERNS]
+
+    # Patterns nominatifs si on a un nom de dirigeant
+    if prenom and nom:
+        p = _normalize(prenom)
+        n = _normalize(nom)
+        candidates = [
+            f"{p}.{n}@{domain}",
+            f"{p[0]}.{n}@{domain}",
+            f"{p}@{domain}",
+            f"{n}@{domain}",
+        ] + candidates
+
+    for email in candidates:
+        if _smtp_exists(email, mx, timeout):
+            return email
+
+    return ""
+
+
 def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     """
     Cherche une adresse email publique sur le site web d'un établissement.
@@ -930,7 +1046,8 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
       2. Si aucun email trouvé, sonde les pages de contact courantes
       3. Priorise les emails via balise <a href="mailto:"> (plus fiables)
       4. Fallback sur regex dans le HTML brut
-      5. Retourne le meilleur email ou "" si rien trouvé
+      5. Si toujours rien → SMTP guessing sur le domaine (find_email_by_smtp)
+      6. Retourne le meilleur email ou "" si rien trouvé
 
     Args:
         url     : URL du site web (doit commencer par http/https)
@@ -982,6 +1099,13 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
         except requests.RequestException:
             # Timeout, SSL error, connexion refusée… on passe à la page suivante
             continue
+
+    # ── Fallback SMTP : si aucun email trouvé sur le site ─────────────────────
+    domain = parsed.netloc.lstrip("www.")
+    if domain:
+        smtp_email = find_email_by_smtp(domain)
+        if smtp_email and _is_professional_email(smtp_email):
+            return smtp_email
 
     return ""
 
@@ -1457,7 +1581,7 @@ class MassiveCollector:
                 email = ""
             return idx, email
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
             futures = {executor.submit(_scrape_one, arg): arg for arg in to_scrape}
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -1613,3 +1737,5 @@ class MassiveCollector:
             progress=1.0,
             done_combinations=total,
         )
+
+

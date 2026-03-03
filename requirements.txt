@@ -7,3 +7,4 @@ python-dotenv>=1.0.0   # Chargement de la clé API depuis .env
 pandas>=2.0.0          # Manipulation des données et affichage dans Streamlit
 beautifulsoup4>=4.12.0 # Parsing HTML pour l'extraction d'emails
 lxml>=5.0.0            # Parser HTML rapide pour BeautifulSoup
+dnspython>=2.4.0       # Résolution MX records pour le SMTP email guessing
