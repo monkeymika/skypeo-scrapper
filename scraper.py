@@ -14,6 +14,7 @@ from __future__ import annotations  # annotations lazy → compatible Python 3.7
 import concurrent.futures
 import csv
 import io
+import json
 import os
 import re
 import smtplib
@@ -34,6 +35,18 @@ try:
     _DNS_OK = True
 except ImportError:
     _DNS_OK = False
+
+try:
+    import whois as _whois_lib
+    _WHOIS_OK = True
+except ImportError:
+    _WHOIS_OK = False
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_OK = True
+except ImportError:
+    _PLAYWRIGHT_OK = False
 
 # Chargement de la clé API depuis le fichier .env
 load_dotenv()
@@ -902,11 +915,30 @@ _CONTACT_PATHS = [
     # À propos / équipe
     "/a-propos", "/a-propos.html", "/about", "/about-us", "/about.html",
     "/qui-sommes-nous", "/equipe", "/team",
+    # Équipe & direction (ajouts)
+    "/staff", "/direction", "/gerant", "/proprietaire", "/chef",
+    "/presentation", "/qui-nous-sommes", "/notre-equipe", "/la-team",
+    "/responsable",
     # Pages spécifiques aux secteurs visés
     "/reservation", "/reservations", "/book", "/booking",
     "/informations", "/coordonnees", "/coordonnées", "/infos",
     "/footer", "/sitemap",
 ]
+
+# Regex emails obfusqués : "nom [at] domaine [dot] fr" ou variantes
+_OBFUSCATED_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+"
+    r"\s*[\[\(\{]?\s*(?:at|@)\s*[\]\)\}]?\s*"
+    r"[a-zA-Z0-9.\-]+"
+    r"\s*[\[\(\{]?\s*(?:dot|\.)\s*[\]\)\}]?\s*"
+    r"[a-zA-Z]{2,}",
+    re.IGNORECASE,
+)
+
+# Regex pour détecter un lien Facebook dans le HTML
+_FB_URL_RE = re.compile(
+    r'https?://(?:www\.)?facebook\.com/(?!sharer|share|dialog|tr\b)[^"\s\'<>&?]{3,}',
+)
 
 # En-tête HTTP pour éviter les blocages basiques (User-Agent navigateur)
 _BROWSER_HEADERS = {
@@ -917,6 +949,178 @@ _BROWSER_HEADERS = {
     ),
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
+
+
+# ── Helpers email scraping ────────────────────────────────────────────────────
+
+def _decode_cloudflare_email(encoded: str) -> str:
+    """
+    Décode un email protégé par Cloudflare (attribut data-cfemail).
+    Algorithme : XOR de chaque octet avec le premier octet (clé).
+    """
+    try:
+        data = bytes.fromhex(encoded)
+        key = data[0]
+        return "".join(chr(b ^ key) for b in data[1:])
+    except Exception:
+        return ""
+
+
+def _deobfuscate_email(text: str) -> str:
+    """
+    Reconstitue un email obfusqué du type "nom [at] domaine [dot] fr".
+    Gère aussi les variantes (at), {at}, espaces parasites, etc.
+    """
+    text = re.sub(r'\s*[\[\(\{]?\s*at\s*[\]\)\}]?\s*', '@', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*[\[\(\{]?\s*dot\s*[\]\)\}]?\s*', '.', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', '', text)
+    return text.lower()
+
+
+def _extract_jsonld_emails(data: object, found: set) -> None:
+    """Parcourt récursivement un objet JSON-LD et extrait les emails."""
+    if isinstance(data, dict):
+        for key, val in data.items():
+            if key.lower() in ("email", "e-mail") and isinstance(val, str):
+                if _is_valid_email(val.lower()):
+                    found.add(val.lower())
+            elif isinstance(val, (dict, list)):
+                _extract_jsonld_emails(val, found)
+    elif isinstance(data, list):
+        for item in data:
+            _extract_jsonld_emails(item, found)
+
+
+def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> None:
+    """
+    Applique toute la chaîne d'extraction sur une page déjà parsée.
+    Ordre : mailto > Cloudflare > JSON-LD > meta > data-attrs > obfusqués > regex.
+    Ajoute les emails valides dans le set `found`.
+    """
+    # 1. Balises <a href="mailto:">
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if href.lower().startswith("mailto:"):
+            email = href[7:].split("?")[0].strip().lower()
+            if _is_valid_email(email):
+                found.add(email)
+
+    # 2. Cloudflare data-cfemail
+    for tag in soup.find_all(attrs={"data-cfemail": True}):
+        decoded = _decode_cloudflare_email(tag["data-cfemail"])
+        if decoded and _is_valid_email(decoded):
+            found.add(decoded.lower())
+
+    # 3. JSON-LD <script type="application/ld+json">
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            _extract_jsonld_emails(data, found)
+        except Exception:
+            pass
+
+    # 4. Balises <meta> (content peut contenir un email)
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "")
+        for email in _EMAIL_RE.findall(content):
+            if _is_valid_email(email.lower()):
+                found.add(email.lower())
+
+    # 5. Attributs data-email / data-mail
+    for attr in ("data-email", "data-mail"):
+        for tag in soup.find_all(attrs={attr: True}):
+            email = tag[attr].strip().lower()
+            if _is_valid_email(email):
+                found.add(email)
+
+    # 6. Emails obfusqués [at] / [dot] dans le texte brut
+    for match in _OBFUSCATED_RE.findall(html):
+        candidate = _deobfuscate_email(match)
+        if _is_valid_email(candidate):
+            found.add(candidate)
+
+    # 7. Spans contigus qui forment une adresse email
+    span_texts = [s.get_text() for s in soup.find_all("span")]
+    joined = "".join(span_texts)
+    for email in _EMAIL_RE.findall(joined):
+        if _is_valid_email(email.lower()):
+            found.add(email.lower())
+
+    # 8. Regex générale sur le HTML brut (filet de sécurité)
+    for email in _EMAIL_RE.findall(html):
+        if _is_valid_email(email.lower()):
+            found.add(email.lower())
+
+
+def _scrape_facebook_email(fb_url: str, timeout: int = 8) -> str:
+    """
+    Tente d'extraire un email professionnel depuis une page Facebook.
+    Meta peut bloquer : encapsulé dans un try/except robuste.
+    """
+    try:
+        resp = requests.get(
+            fb_url,
+            headers=_BROWSER_HEADERS,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        found: set = set()
+        _extract_emails_from_soup(soup, resp.text, found)
+        professional = [e for e in found if _is_professional_email(e)]
+        if professional:
+            return sorted(professional, key=_email_priority)[0]
+    except Exception:
+        pass
+    return ""
+
+
+def _whois_email(domain: str) -> str:
+    """
+    Tente d'extraire l'email du registrant via WHOIS (python-whois).
+    Fonctionnel uniquement si python-whois est installé.
+    """
+    if not _WHOIS_OK:
+        return ""
+    try:
+        w = _whois_lib.whois(domain)
+        emails = w.emails or []
+        if isinstance(emails, str):
+            emails = [emails]
+        for email in emails:
+            if email and _is_professional_email(email.lower()):
+                return email.lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _playwright_scrape(url: str, timeout: int = 15) -> str:
+    """
+    Rend la page via Playwright (headless Chromium) et extrait les emails
+    du HTML rendu côté client (sites JavaScript).
+    Nécessite : pip install playwright && playwright install chromium
+    """
+    if not _PLAYWRIGHT_OK:
+        return ""
+    try:
+        with _sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(extra_http_headers=_BROWSER_HEADERS)
+            page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+        found: set = set()
+        _extract_emails_from_soup(soup, html, found)
+        professional = [e for e in found if _is_professional_email(e)]
+        if professional:
+            return sorted(professional, key=_email_priority)[0]
+    except Exception:
+        pass
+    return ""
 
 
 def _is_valid_email(email: str) -> bool:
@@ -1051,17 +1255,18 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     """
     Cherche une adresse email publique sur le site web d'un établissement.
 
-    Stratégie :
-      1. Visite la page principale (url)
-      2. Si aucun email trouvé, sonde les pages de contact courantes
-      3. Priorise les emails via balise <a href="mailto:"> (plus fiables)
-      4. Fallback sur regex dans le HTML brut
-      5. Si toujours rien → SMTP guessing sur le domaine (find_email_by_smtp)
-      6. Retourne le meilleur email ou "" si rien trouvé
+    Pipeline complet (ordre de priorité) :
+      1. Pour chaque page (home + contact pages) :
+         mailto > Cloudflare data-cfemail > JSON-LD > <meta> >
+         data-email/data-mail > emails obfusqués [at][dot] > spans > regex
+      2. Facebook scraping (si lien FB trouvé sur le site)
+      3. WHOIS registrant email (python-whois, optionnel)
+      4. Playwright headless (sites JavaScript, optionnel)
+      5. SMTP guessing (dernier recours)
 
     Args:
         url     : URL du site web (doit commencer par http/https)
-        timeout : Délai max par requête en secondes
+        timeout : Délai max par requête HTTP en secondes
 
     Returns:
         Adresse email (str) ou chaîne vide.
@@ -1070,9 +1275,13 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
         return ""
 
     parsed = urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    pages = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
+    base   = f"{parsed.scheme}://{parsed.netloc}"
+    domain = parsed.netloc.lstrip("www.")
+    pages  = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
 
+    fb_url_found: str = ""   # lien Facebook détecté pour scraping ultérieur
+
+    # ── Étape 1 : scraping statique de toutes les pages ──────────────────────
     for page_url in pages:
         try:
             resp = requests.get(
@@ -1086,32 +1295,44 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
             if "text/html" not in resp.headers.get("Content-Type", ""):
                 continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup  = BeautifulSoup(resp.text, "html.parser")
             found: set[str] = set()
 
-            # ── Priorité 1 : balises <a href="mailto:..."> ────────────────────
-            for tag in soup.find_all("a", href=True):
-                href = tag["href"]
-                if href.lower().startswith("mailto:"):
-                    email = href[7:].split("?")[0].strip().lower()
-                    if _is_valid_email(email):
-                        found.add(email)
+            _extract_emails_from_soup(soup, resp.text, found)
 
-            # ── Priorité 2 : regex sur le texte HTML brut ─────────────────────
-            for email in _EMAIL_RE.findall(resp.text):
-                if _is_valid_email(email.lower()):
-                    found.add(email.lower())
+            # Mémoriser le premier lien Facebook trouvé
+            if not fb_url_found:
+                fb_match = _FB_URL_RE.search(resp.text)
+                if fb_match:
+                    fb_url_found = fb_match.group(0).rstrip("/")
 
-            if found:
-                # Retourne le meilleur (email métier > générique)
-                return sorted(found, key=_email_priority)[0]
+            # Filtrer les emails non-professionnels et retourner le meilleur
+            professional = [e for e in found if _is_professional_email(e)]
+            if professional:
+                return sorted(professional, key=_email_priority)[0]
 
         except requests.RequestException:
-            # Timeout, SSL error, connexion refusée… on passe à la page suivante
             continue
 
-    # ── Fallback SMTP : si aucun email trouvé sur le site ─────────────────────
-    domain = parsed.netloc.lstrip("www.")
+    # ── Étape 2 : scraping Facebook ──────────────────────────────────────────
+    if fb_url_found:
+        fb_email = _scrape_facebook_email(fb_url_found, timeout=timeout)
+        if fb_email:
+            return fb_email
+
+    # ── Étape 3 : WHOIS (registrant email) ───────────────────────────────────
+    if domain:
+        whois_email = _whois_email(domain)
+        if whois_email:
+            return whois_email
+
+    # ── Étape 4 : Playwright (rendu JS) ──────────────────────────────────────
+    if _PLAYWRIGHT_OK:
+        pw_email = _playwright_scrape(url, timeout=15)
+        if pw_email:
+            return pw_email
+
+    # ── Étape 5 : SMTP guessing ───────────────────────────────────────────────
     if domain:
         smtp_email = find_email_by_smtp(domain)
         if smtp_email and _is_professional_email(smtp_email):

@@ -8,3 +8,10 @@ pandas>=2.0.0          # Manipulation des données et affichage dans Streamlit
 beautifulsoup4>=4.12.0 # Parsing HTML pour l'extraction d'emails
 lxml>=5.0.0            # Parser HTML rapide pour BeautifulSoup
 dnspython>=2.4.0       # Résolution MX records pour le SMTP email guessing
+
+# ── Optionnels (améliorent le taux de collecte d'emails) ─────────────────────
+python-whois>=0.9.0    # WHOIS fallback : email du registrant du domaine
+                       # → pip install python-whois
+
+playwright>=1.40.0     # Playwright headless : sites JavaScript
+                       # → pip install playwright && playwright install chromium
