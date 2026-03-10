@@ -883,13 +883,22 @@ FRENCH_CITIES = [
 # Regex standard pour détecter les adresses email dans du HTML brut
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
-# Préfixes locaux génériques à déprioritiser (pas à exclure complètement)
+# Parties locales à rejeter définitivement (emails système/registrar, jamais un contact réel)
+_LOCAL_REJECT = frozenset({
+    "abuse", "hostmaster", "postmaster", "support", "sales",
+    "tldsupport", "noreply", "no-reply", "donotreply", "do-not-reply",
+    "mailer-daemon", "bounce", "webmaster", "juridique",
+    "dpo", "rgpd", "gdpr", "privacy", "legal", "compliance",
+    "spam", "phishing", "report", "security", "helpdesk",
+})
+
+# Préfixes génériques à déprioritiser (valides mais moins bons)
 _GENERIC_PREFIXES = {
-    "noreply", "no-reply", "donotreply", "do-not-reply",
-    "postmaster", "mailer-daemon", "bounce", "webmaster",
+    "contact", "info", "hello", "bonjour", "accueil",
+    "administration", "admin", "secretariat",
 }
 
-# Domaines techniques/système à exclure totalement
+# Domaines techniques/système à exclure totalement (substring matching)
 _DOMAIN_BLACKLIST = {
     # Erreurs / placeholders
     "sentry.io", "example.com", "example.org", "example.net",
@@ -897,10 +906,10 @@ _DOMAIN_BLACKLIST = {
     # Hébergement / CDN
     "amazonaws.com", "cloudflare.com", "cloudfront.net",
     "fastly.net", "akamaiedge.net", "akamai.net",
-    "gstatic.com", "googleapis.com", "googletagmanager.com",
+    "gstatic", "googleapis.com", "googletagmanager.com",
     "google.com", "google.fr", "googlemail.com",
     # Plateformes CMS / e-commerce
-    "wixpress.com", "wix.com", "wixsite.com",
+    "wixpress.com", "wixstatic", "wix.com", "wixsite.com",
     "squarespace.com", "squarespace-cdn.com",
     "shopify.com", "myshopify.com",
     "wordpress.com", "wp.com",
@@ -921,6 +930,15 @@ _DOMAIN_BLACKLIST = {
     "intercom.io", "intercom.com",
     # Schemas / ontologies
     "w3.org", "schema.org", "ogp.me",
+    # Registrars / bureaux d'enregistrement (emails WHOIS/admin, jamais propriétaire)
+    "registrarsafe", "key-systems", "godaddy", "1und1",
+    "openprovider", "cscglobal", "gandi.net",
+    "infomaniak.com", "ionos.com", "ionos.de",
+    # CDN / ressources statiques
+    "bootstrapcdn", "cloudinary.com", "unpkg.com", "jsdelivr.net",
+    # Divers plateformes/services parasites
+    "axept", "buymeacoffee", "resto-pro",
+    "creativecommons", "gravatar.com",
     # Artefacts regex fréquents
     "2x.png", "3x.png", "1x.png",
 }
@@ -1049,15 +1067,18 @@ def _extract_jsonld_emails(data: object, found: set) -> None:
             _extract_jsonld_emails(item, found)
 
 
-def _extract_emails_trusted(soup: BeautifulSoup) -> set:
+def _extract_emails_from_page(soup: BeautifulSoup) -> set:
     """
-    Extrait les emails depuis les sources structurées et fiables uniquement :
-    mailto, Cloudflare, JSON-LD, data-email/data-mail.
-    Ces sources ne produisent presque jamais de faux positifs.
+    Extrait les emails depuis les 3 sources fiables uniquement :
+      1. <a href="mailto:..."> + décodage Cloudflare data-cfemail
+      2. JSON-LD <script type="application/ld+json">
+      3. Attributs content des balises <meta>
+
+    Aucun regex sur le HTML brut — trop de faux positifs.
     """
     found: set = set()
 
-    # 1. Balises <a href="mailto:"> — source la plus fiable
+    # ── 1. <a href="mailto:"> ─────────────────────────────────────────────────
     for tag in soup.find_all("a", href=True):
         href = tag["href"]
         if href.lower().startswith("mailto:"):
@@ -1065,13 +1086,13 @@ def _extract_emails_trusted(soup: BeautifulSoup) -> set:
             if _is_valid_email(email):
                 found.add(email)
 
-    # 2. Cloudflare data-cfemail
+    # ── 1b. Cloudflare data-cfemail (encodage de liens mailto) ────────────────
     for tag in soup.find_all(attrs={"data-cfemail": True}):
         decoded = _decode_cloudflare_email(tag["data-cfemail"])
         if decoded and _is_valid_email(decoded):
             found.add(decoded.lower())
 
-    # 3. JSON-LD <script type="application/ld+json">
+    # ── 2. JSON-LD ────────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -1079,58 +1100,21 @@ def _extract_emails_trusted(soup: BeautifulSoup) -> set:
         except Exception:
             pass
 
-    # 4. Attributs data-email / data-mail
-    for attr in ("data-email", "data-mail"):
-        for tag in soup.find_all(attrs={attr: True}):
-            email = tag[attr].strip().lower()
-            if _is_valid_email(email):
-                found.add(email)
-
-    return found
-
-
-def _extract_emails_fallback(soup: BeautifulSoup, html: str) -> set:
-    """
-    Extrait les emails depuis les sources moins fiables (regex, meta, spans, obfusqués).
-    N'utilisé qu'en dernier recours si les sources fiables n'ont rien donné.
-    Applique les filtres stricts de _is_valid_email + filtre pro.
-    """
-    found: set = set()
-
-    # 5. Balises <meta> (contenu textuel)
+    # ── 3. <meta> tags ────────────────────────────────────────────────────────
     for meta in soup.find_all("meta"):
         content = meta.get("content", "")
+        if "@" not in content:
+            continue
         for email in _EMAIL_RE.findall(content):
             if _is_valid_email(email.lower()):
                 found.add(email.lower())
 
-    # 6. Emails obfusqués [at] / [dot] dans le texte brut
-    for match in _OBFUSCATED_RE.findall(html):
-        candidate = _deobfuscate_email(match)
-        if _is_valid_email(candidate):
-            found.add(candidate)
-
-    # 7. Spans contigus (reconstitution adresse fragmentée)
-    span_texts = [s.get_text() for s in soup.find_all("span")]
-    joined = "".join(span_texts)
-    for email in _EMAIL_RE.findall(joined):
-        if _is_valid_email(email.lower()):
-            found.add(email.lower())
-
-    # 8. Regex sur le HTML brut — dernier recours, filtre stricts obligatoires
-    # On ne garde que les emails professionnels (exclut gmail/yahoo/etc.)
-    for email in _EMAIL_RE.findall(html):
-        e = email.lower()
-        if _is_valid_email(e) and _is_professional_email(e):
-            found.add(e)
-
     return found
 
 
+# Alias de compatibilité pour _playwright_scrape et _scrape_facebook_email
 def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> None:
-    """Wrapper qui merge trusted + fallback dans `found` (rétrocompatibilité)."""
-    found.update(_extract_emails_trusted(soup))
-    found.update(_extract_emails_fallback(soup, html))
+    found.update(_extract_emails_from_page(soup))
 
 
 def _scrape_facebook_email(fb_url: str, timeout: int = 8) -> str:
@@ -1194,11 +1178,10 @@ def _playwright_scrape(url: str, timeout: int = 15) -> str:
             html = page.content()
             browser.close()
         soup = BeautifulSoup(html, "html.parser")
-        found: set = set()
-        _extract_emails_from_soup(soup, html, found)
-        professional = [e for e in found if _is_professional_email(e)]
-        if professional:
-            return sorted(professional, key=_email_priority)[0]
+        found = _extract_emails_from_page(soup)
+        valid = [e for e in found if _is_valid_email(e)]
+        if valid:
+            return sorted(valid, key=_email_priority)[0]
     except Exception:
         pass
     return ""
@@ -1207,44 +1190,43 @@ def _playwright_scrape(url: str, timeout: int = 15) -> str:
 def _is_valid_email(email: str) -> bool:
     """
     Retourne True si l'email semble légitime.
-    Critères stricts : format, TLD reconnu, aucun artefact JS/CSS/technique.
+    Critères : format strict, TLD 2-6 lettres, partie locale saine,
+    domaine non blacklisté, local non rejeté (système/registrar).
     """
     email = email.lower().strip()
-    # Doit contenir exactement un @
+    # Exactement un @
     if email.count("@") != 1:
         return False
     local, domain = email.split("@", 1)
 
     # ── Partie locale ────────────────────────────────────────────────────────
-    # Minimum 2 caractères
-    if len(local) < 2:
+    if len(local) < 2 or len(local) > 40:
         return False
-    # Pas de point en début ou fin
     if local.startswith(".") or local.endswith("."):
         return False
     # Caractères autorisés uniquement (pas de (, ), [, ], espaces, etc.)
     if re.search(r"[^a-z0-9._%+\-]", local):
         return False
-    # Aucun segment ne doit être un mot-clé JS/CSS/technique
+    # Rejeter les emails système/registrar
+    local_clean = local.replace("-", "").replace("_", "").replace(".", "")
+    if local in _LOCAL_REJECT or local_clean in _LOCAL_REJECT:
+        return False
+    # Rejeter les artefacts JS/CSS (segment par segment)
     segments = re.split(r"[.\-_+]", local)
     if any(seg in _JS_CSS_LOCAL_BLACKLIST for seg in segments if len(seg) > 1):
         return False
 
     # ── Domaine ──────────────────────────────────────────────────────────────
-    # Doit contenir un point
     if "." not in domain:
         return False
-    # Caractères autorisés uniquement (alphanum, points, tirets)
     if re.search(r"[^a-z0-9.\-]", domain):
         return False
-    # TLD doit être 2 à 6 lettres uniquement (filtre les TLDs numériques, .js, .min…)
+    # TLD : 2 à 6 lettres uniquement
     tld = domain.rsplit(".", 1)[1]
     if not re.match(r"^[a-z]{2,6}$", tld):
         return False
-    # Exclure les faux TLDs connus
     if any(domain.endswith(ext) for ext in _FAKE_TLDS):
         return False
-    # Exclure les domaines techniques connus
     if any(bl in domain for bl in _DOMAIN_BLACKLIST):
         return False
 
@@ -1363,16 +1345,15 @@ def find_email_by_smtp(
 
 def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     """
-    Cherche une adresse email publique sur le site web d'un établissement.
+    Cherche une adresse email sur le site web d'un établissement.
 
-    Pipeline complet (ordre de priorité) :
-      1. Pour chaque page (home + contact pages) :
-         mailto > Cloudflare data-cfemail > JSON-LD > <meta> >
-         data-email/data-mail > emails obfusqués [at][dot] > spans > regex
-      2. Facebook scraping (si lien FB trouvé sur le site)
-      3. WHOIS registrant email (python-whois, optionnel)
-      4. Playwright headless (sites JavaScript, optionnel)
-      5. SMTP guessing (dernier recours)
+    Pipeline (ordre de priorité) :
+      1. Pour chaque page (home + pages contact) :
+         <a href="mailto:"> + Cloudflare decode + JSON-LD + <meta>
+      2. Playwright headless si rien trouvé (sites JavaScript, optionnel)
+      3. SMTP guessing (dernier recours)
+
+    Aucun regex HTML brut. Accepte tous les emails valides (y compris Gmail etc.)
 
     Args:
         url     : URL du site web (doit commencer par http/https)
@@ -1389,11 +1370,7 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     domain = parsed.netloc.lstrip("www.")
     pages  = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
 
-    fb_url_found: str = ""          # lien Facebook détecté pour scraping ultérieur
-    fallback_candidates: set = set()  # emails regex accumulés sur toutes les pages
-
-    # ── Étape 1a : sources fiables sur toutes les pages ───────────────────────
-    # mailto, Cloudflare, JSON-LD, data-email → très peu de faux positifs
+    # ── Étape 1 : sources fiables sur toutes les pages ────────────────────────
     for page_url in pages:
         try:
             resp = requests.get(
@@ -1408,52 +1385,24 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Mémoriser le premier lien Facebook trouvé
-            if not fb_url_found:
-                fb_match = _FB_URL_RE.search(resp.text)
-                if fb_match:
-                    fb_url_found = fb_match.group(0).rstrip("/")
-
-            # Sources fiables uniquement
-            trusted = _extract_emails_trusted(soup)
-            professional = [e for e in trusted if _is_professional_email(e)]
-            if professional:
-                return sorted(professional, key=_email_priority)[0]
-
-            # Accumuler les candidates regex pour usage en fallback ultérieur
-            fallback_candidates.update(_extract_emails_fallback(soup, resp.text))
+            found = _extract_emails_from_page(soup)
+            valid = [e for e in found if _is_valid_email(e)]
+            if valid:
+                return sorted(valid, key=_email_priority)[0]
 
         except requests.RequestException:
             continue
 
-    # ── Étape 1b : fallback regex si les sources fiables n'ont rien donné ────
-    pro_fallback = [e for e in fallback_candidates if _is_professional_email(e)]
-    if pro_fallback:
-        return sorted(pro_fallback, key=_email_priority)[0]
-
-    # ── Étape 2 : scraping Facebook ──────────────────────────────────────────
-    if fb_url_found:
-        fb_email = _scrape_facebook_email(fb_url_found, timeout=timeout)
-        if fb_email:
-            return fb_email
-
-    # ── Étape 3 : WHOIS (registrant email) ───────────────────────────────────
-    if domain:
-        whois_email = _whois_email(domain)
-        if whois_email:
-            return whois_email
-
-    # ── Étape 4 : Playwright (rendu JS) ──────────────────────────────────────
+    # ── Étape 2 : Playwright (rendu JS) ──────────────────────────────────────
     if _PLAYWRIGHT_OK:
         pw_email = _playwright_scrape(url, timeout=15)
         if pw_email:
             return pw_email
 
-    # ── Étape 5 : SMTP guessing ───────────────────────────────────────────────
+    # ── Étape 3 : SMTP guessing ───────────────────────────────────────────────
     if domain:
         smtp_email = find_email_by_smtp(domain)
-        if smtp_email and _is_professional_email(smtp_email):
+        if smtp_email and _is_valid_email(smtp_email):
             return smtp_email
 
     return ""
@@ -1925,9 +1874,6 @@ class MassiveCollector:
         def _scrape_one(args: tuple) -> tuple:
             idx, place = args
             email = scrape_email_from_website(place["websiteUri"], timeout=5)
-            # Filtrer les emails de providers gratuits
-            if email and not _is_professional_email(email):
-                email = ""
             return idx, email
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
