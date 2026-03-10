@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+import unicodedata
 
 import pandas as pd
 import streamlit as st
@@ -93,6 +94,32 @@ def _fmt_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def _slugify(text: str) -> str:
+    """Supprime les accents, met en minuscules, remplace espaces/tirets par '_'."""
+    text = unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode()
+    text = text.lower().replace("&", "").replace("-", "_").replace("'", "").replace(" ", "_")
+    # Nettoyer les underscores multiples
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text.strip("_")
+
+
+def _generate_filename(sectors: list[str], dept_code: str | None) -> str:
+    """Génère un nom de fichier lisible : restauration_beaute_moselle.csv"""
+    if sectors:
+        sectors_part = "_".join(_slugify(SECTORS[s]["label"]) for s in sectors)
+    else:
+        sectors_part = "collecte"
+
+    if dept_code is None:
+        dept_part = "france"
+    else:
+        dept_name = FRENCH_DEPARTMENTS.get(dept_code, dept_code)
+        dept_part = _slugify(dept_name)
+
+    return f"{sectors_part}_{dept_part}.csv"
 
 
 def _read_csv_safe(path: str) -> bytes | None:
@@ -404,10 +431,11 @@ with tab_massive:
         with cfg_col2:
             st.markdown('<div class="section-header">Fichier de sortie</div>', unsafe_allow_html=True)
 
+            auto_filename = _generate_filename(selected_sectors, dept_filter_value)
             output_filename = st.text_input(
                 "Fichier CSV de sortie",
-                value="collecte_france.csv",
-                help="Nom du fichier CSV où les résultats seront sauvegardés.",
+                value=auto_filename,
+                help="Nom généré automatiquement à partir des secteurs et de la zone. Modifiable.",
             )
 
             file_exists = os.path.exists(output_filename) if output_filename else False
