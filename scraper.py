@@ -891,18 +891,76 @@ _GENERIC_PREFIXES = {
 
 # Domaines techniques/système à exclure totalement
 _DOMAIN_BLACKLIST = {
-    "sentry.io", "example.com", "test.com", "wixpress.com",
-    "amazonaws.com", "cloudflare.com", "google.com",
-    "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
-    "2x.png", "3x.png",  # artefacts regex sur les images retina
-    "squarespace.com", "shopify.com", "wordpress.com", "wix.com",
+    # Erreurs / placeholders
+    "sentry.io", "example.com", "example.org", "example.net",
+    "test.com", "test.fr", "domain.com", "yourdomain.com", "email.com",
+    # Hébergement / CDN
+    "amazonaws.com", "cloudflare.com", "cloudfront.net",
+    "fastly.net", "akamaiedge.net", "akamai.net",
+    "gstatic.com", "googleapis.com", "googletagmanager.com",
+    "google.com", "google.fr", "googlemail.com",
+    # Plateformes CMS / e-commerce
+    "wixpress.com", "wix.com", "wixsite.com",
+    "squarespace.com", "squarespace-cdn.com",
+    "shopify.com", "myshopify.com",
+    "wordpress.com", "wp.com",
+    "jimdo.com", "weebly.com", "webflow.io",
+    "prestashop.com", "magento.com",
+    # Réseaux sociaux
+    "facebook.com", "fbcdn.net", "instagram.com",
+    "twitter.com", "t.co", "linkedin.com",
+    "tiktok.com", "snapchat.com", "youtube.com",
+    # Email marketing / transactionnel
     "mailchimp.com", "mailjet.com", "sendinblue.com", "brevo.com",
-    "w3.org", "schema.org", "googleapis.com", "gstatic.com",
-    "pixel.facebook.com", "doubleclick.net", "googlesyndication.com",
+    "mailgun.org", "sendgrid.net", "mandrillapp.com",
+    "constantcontact.com", "klaviyo.com",
+    # Analytics / tracking
+    "doubleclick.net", "googlesyndication.com",
+    "pixel.facebook.com", "analytics.google.com",
+    "hotjar.com", "segment.io", "mixpanel.com",
+    "intercom.io", "intercom.com",
+    # Schemas / ontologies
+    "w3.org", "schema.org", "ogp.me",
+    # Artefacts regex fréquents
+    "2x.png", "3x.png", "1x.png",
 }
 
 # Extensions qui ne sont jamais des emails (artefacts regex)
-_FAKE_TLDS = {".png", ".jpg", ".gif", ".svg", ".js", ".css", ".woff", ".ttf"}
+_FAKE_TLDS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
+    ".js", ".ts", ".jsx", ".tsx", ".mjs",
+    ".css", ".scss", ".less",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".map", ".json", ".xml", ".yaml", ".yml",
+    ".min", ".gz", ".zip",
+}
+
+# Mots JS/CSS interdits dans la partie locale d'un email
+# Vérifié segment par segment (après split sur ".")
+_JS_CSS_LOCAL_BLACKLIST = frozenset({
+    # Objets / variables JS globaux
+    "window", "document", "navigator", "location", "history",
+    "screen", "console", "process", "global", "globalthis",
+    "module", "exports", "require", "prototype", "constructor",
+    "arguments", "undefined", "null", "nan", "infinity",
+    # Mots-clés JS
+    "function", "return", "typeof", "instanceof", "async", "await",
+    "var", "let", "const", "this", "self", "super",
+    "class", "extends", "import", "export", "default",
+    "if", "else", "for", "while", "switch", "case",
+    "break", "continue", "try", "catch", "throw", "new", "delete",
+    "true", "false", "void",
+    # Méthodes Math / utilitaires
+    "floor", "ceil", "round", "max", "min", "random", "sqrt", "abs",
+    "parse", "stringify", "encode", "decode", "escape",
+    # CSS / layout
+    "block", "inline", "flex", "grid", "none", "auto",
+    "header", "footer", "sidebar", "wrapper", "container",
+    "overlay", "modal", "static", "template", "component",
+    # Mots techniques divers
+    "body", "head", "html", "href", "src",
+    "style", "class", "type", "value", "name",
+})
 
 # Pages de contact courantes à sonder si la page principale est vide
 _CONTACT_PATHS = [
@@ -991,13 +1049,15 @@ def _extract_jsonld_emails(data: object, found: set) -> None:
             _extract_jsonld_emails(item, found)
 
 
-def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> None:
+def _extract_emails_trusted(soup: BeautifulSoup) -> set:
     """
-    Applique toute la chaîne d'extraction sur une page déjà parsée.
-    Ordre : mailto > Cloudflare > JSON-LD > meta > data-attrs > obfusqués > regex.
-    Ajoute les emails valides dans le set `found`.
+    Extrait les emails depuis les sources structurées et fiables uniquement :
+    mailto, Cloudflare, JSON-LD, data-email/data-mail.
+    Ces sources ne produisent presque jamais de faux positifs.
     """
-    # 1. Balises <a href="mailto:">
+    found: set = set()
+
+    # 1. Balises <a href="mailto:"> — source la plus fiable
     for tag in soup.find_all("a", href=True):
         href = tag["href"]
         if href.lower().startswith("mailto:"):
@@ -1019,19 +1079,30 @@ def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> Non
         except Exception:
             pass
 
-    # 4. Balises <meta> (content peut contenir un email)
-    for meta in soup.find_all("meta"):
-        content = meta.get("content", "")
-        for email in _EMAIL_RE.findall(content):
-            if _is_valid_email(email.lower()):
-                found.add(email.lower())
-
-    # 5. Attributs data-email / data-mail
+    # 4. Attributs data-email / data-mail
     for attr in ("data-email", "data-mail"):
         for tag in soup.find_all(attrs={attr: True}):
             email = tag[attr].strip().lower()
             if _is_valid_email(email):
                 found.add(email)
+
+    return found
+
+
+def _extract_emails_fallback(soup: BeautifulSoup, html: str) -> set:
+    """
+    Extrait les emails depuis les sources moins fiables (regex, meta, spans, obfusqués).
+    N'utilisé qu'en dernier recours si les sources fiables n'ont rien donné.
+    Applique les filtres stricts de _is_valid_email + filtre pro.
+    """
+    found: set = set()
+
+    # 5. Balises <meta> (contenu textuel)
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "")
+        for email in _EMAIL_RE.findall(content):
+            if _is_valid_email(email.lower()):
+                found.add(email.lower())
 
     # 6. Emails obfusqués [at] / [dot] dans le texte brut
     for match in _OBFUSCATED_RE.findall(html):
@@ -1039,17 +1110,27 @@ def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> Non
         if _is_valid_email(candidate):
             found.add(candidate)
 
-    # 7. Spans contigus qui forment une adresse email
+    # 7. Spans contigus (reconstitution adresse fragmentée)
     span_texts = [s.get_text() for s in soup.find_all("span")]
     joined = "".join(span_texts)
     for email in _EMAIL_RE.findall(joined):
         if _is_valid_email(email.lower()):
             found.add(email.lower())
 
-    # 8. Regex générale sur le HTML brut (filet de sécurité)
+    # 8. Regex sur le HTML brut — dernier recours, filtre stricts obligatoires
+    # On ne garde que les emails professionnels (exclut gmail/yahoo/etc.)
     for email in _EMAIL_RE.findall(html):
-        if _is_valid_email(email.lower()):
-            found.add(email.lower())
+        e = email.lower()
+        if _is_valid_email(e) and _is_professional_email(e):
+            found.add(e)
+
+    return found
+
+
+def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> None:
+    """Wrapper qui merge trusted + fallback dans `found` (rétrocompatibilité)."""
+    found.update(_extract_emails_trusted(soup))
+    found.update(_extract_emails_fallback(soup, html))
 
 
 def _scrape_facebook_email(fb_url: str, timeout: int = 8) -> str:
@@ -1124,20 +1205,49 @@ def _playwright_scrape(url: str, timeout: int = 15) -> str:
 
 
 def _is_valid_email(email: str) -> bool:
-    """Retourne True si l'email semble légitime (ni système, ni artefact regex)."""
+    """
+    Retourne True si l'email semble légitime.
+    Critères stricts : format, TLD reconnu, aucun artefact JS/CSS/technique.
+    """
     email = email.lower().strip()
-    if "@" not in email:
+    # Doit contenir exactement un @
+    if email.count("@") != 1:
         return False
-    local, domain = email.rsplit("@", 1)
-    # Exclure les faux domaines issus d'images/scripts
+    local, domain = email.split("@", 1)
+
+    # ── Partie locale ────────────────────────────────────────────────────────
+    # Minimum 2 caractères
+    if len(local) < 2:
+        return False
+    # Pas de point en début ou fin
+    if local.startswith(".") or local.endswith("."):
+        return False
+    # Caractères autorisés uniquement (pas de (, ), [, ], espaces, etc.)
+    if re.search(r"[^a-z0-9._%+\-]", local):
+        return False
+    # Aucun segment ne doit être un mot-clé JS/CSS/technique
+    segments = re.split(r"[.\-_+]", local)
+    if any(seg in _JS_CSS_LOCAL_BLACKLIST for seg in segments if len(seg) > 1):
+        return False
+
+    # ── Domaine ──────────────────────────────────────────────────────────────
+    # Doit contenir un point
+    if "." not in domain:
+        return False
+    # Caractères autorisés uniquement (alphanum, points, tirets)
+    if re.search(r"[^a-z0-9.\-]", domain):
+        return False
+    # TLD doit être 2 à 6 lettres uniquement (filtre les TLDs numériques, .js, .min…)
+    tld = domain.rsplit(".", 1)[1]
+    if not re.match(r"^[a-z]{2,6}$", tld):
+        return False
+    # Exclure les faux TLDs connus
     if any(domain.endswith(ext) for ext in _FAKE_TLDS):
         return False
     # Exclure les domaines techniques connus
     if any(bl in domain for bl in _DOMAIN_BLACKLIST):
         return False
-    # Le domaine doit contenir un point (TLD réel)
-    if "." not in domain:
-        return False
+
     return True
 
 
@@ -1279,9 +1389,11 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     domain = parsed.netloc.lstrip("www.")
     pages  = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
 
-    fb_url_found: str = ""   # lien Facebook détecté pour scraping ultérieur
+    fb_url_found: str = ""          # lien Facebook détecté pour scraping ultérieur
+    fallback_candidates: set = set()  # emails regex accumulés sur toutes les pages
 
-    # ── Étape 1 : scraping statique de toutes les pages ──────────────────────
+    # ── Étape 1a : sources fiables sur toutes les pages ───────────────────────
+    # mailto, Cloudflare, JSON-LD, data-email → très peu de faux positifs
     for page_url in pages:
         try:
             resp = requests.get(
@@ -1295,10 +1407,7 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
             if "text/html" not in resp.headers.get("Content-Type", ""):
                 continue
 
-            soup  = BeautifulSoup(resp.text, "html.parser")
-            found: set[str] = set()
-
-            _extract_emails_from_soup(soup, resp.text, found)
+            soup = BeautifulSoup(resp.text, "html.parser")
 
             # Mémoriser le premier lien Facebook trouvé
             if not fb_url_found:
@@ -1306,13 +1415,22 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
                 if fb_match:
                     fb_url_found = fb_match.group(0).rstrip("/")
 
-            # Filtrer les emails non-professionnels et retourner le meilleur
-            professional = [e for e in found if _is_professional_email(e)]
+            # Sources fiables uniquement
+            trusted = _extract_emails_trusted(soup)
+            professional = [e for e in trusted if _is_professional_email(e)]
             if professional:
                 return sorted(professional, key=_email_priority)[0]
 
+            # Accumuler les candidates regex pour usage en fallback ultérieur
+            fallback_candidates.update(_extract_emails_fallback(soup, resp.text))
+
         except requests.RequestException:
             continue
+
+    # ── Étape 1b : fallback regex si les sources fiables n'ont rien donné ────
+    pro_fallback = [e for e in fallback_candidates if _is_professional_email(e)]
+    if pro_fallback:
+        return sorted(pro_fallback, key=_email_priority)[0]
 
     # ── Étape 2 : scraping Facebook ──────────────────────────────────────────
     if fb_url_found:
