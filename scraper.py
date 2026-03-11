@@ -883,6 +883,11 @@ FRENCH_CITIES = [
 # Regex standard pour détecter les adresses email dans du HTML brut
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+# Regex emails en contexte HTML : >email@domain< (texte entre balises, y compris dans scripts SSR)
+_HTML_CONTEXT_EMAIL_RE = re.compile(
+    r">[\s\u00a0]*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})[\s\u00a0]*<"
+)
+
 # Parties locales à rejeter définitivement (emails système/registrar, jamais un contact réel)
 _LOCAL_REJECT = frozenset({
     "abuse", "hostmaster", "postmaster", "support", "sales",
@@ -900,9 +905,12 @@ _GENERIC_PREFIXES = {
 
 # Domaines techniques/système à exclure totalement (substring matching)
 _DOMAIN_BLACKLIST = {
-    # Erreurs / placeholders
+    # Erreurs / placeholders (anglais et français)
     "sentry.io", "example.com", "example.org", "example.net",
+    "exemple.com", "exemple.fr", "exemple.org",
     "test.com", "test.fr", "domain.com", "yourdomain.com", "email.com",
+    "votre-domaine.fr", "mondomaine.fr", "votresite.fr", "monsite.fr",
+    "votre-email.com", "tonemail.com",
     # Hébergement / CDN
     "amazonaws.com", "cloudflare.com", "cloudfront.net",
     "fastly.net", "akamaiedge.net", "akamai.net",
@@ -1067,14 +1075,13 @@ def _extract_jsonld_emails(data: object, found: set) -> None:
             _extract_jsonld_emails(item, found)
 
 
-def _extract_emails_from_page(soup: BeautifulSoup) -> set:
+def _extract_emails_from_page(soup: BeautifulSoup, html: str = "") -> set:
     """
-    Extrait les emails depuis les 3 sources fiables uniquement :
+    Extrait les emails depuis 4 sources :
       1. <a href="mailto:..."> + décodage Cloudflare data-cfemail
       2. JSON-LD <script type="application/ld+json">
       3. Attributs content des balises <meta>
-
-    Aucun regex sur le HTML brut — trop de faux positifs.
+      4. Emails en contexte HTML (>email@domain<) — capte les pages SSR/JSX
     """
     found: set = set()
 
@@ -1109,12 +1116,34 @@ def _extract_emails_from_page(soup: BeautifulSoup) -> set:
             if _is_valid_email(email.lower()):
                 found.add(email.lower())
 
+    # ── 4. Contexte HTML >email@domain< (pages SSR, JSX sérialisé) ───────────
+    if html and "@" in html:
+        for email in _HTML_CONTEXT_EMAIL_RE.findall(html):
+            if _is_valid_email(email.lower()):
+                found.add(email.lower())
+
+    return found
+
+
+def _extract_emails_from_visible_text(soup: BeautifulSoup) -> set:
+    """
+    Fallback : regex sur le texte visible uniquement (hors <script> et <style>).
+    Évite les faux positifs JS/CSS en ne travaillant que sur le contenu affiché.
+    Modifie le soup en place (decompose) — ne pas réutiliser après appel.
+    """
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    found: set = set()
+    for email in _EMAIL_RE.findall(text):
+        if _is_valid_email(email.lower()):
+            found.add(email.lower())
     return found
 
 
 # Alias de compatibilité pour _playwright_scrape et _scrape_facebook_email
 def _extract_emails_from_soup(soup: BeautifulSoup, html: str, found: set) -> None:
-    found.update(_extract_emails_from_page(soup))
+    found.update(_extract_emails_from_page(soup, html))
 
 
 def _scrape_facebook_email(fb_url: str, timeout: int = 8) -> str:
@@ -1162,10 +1191,23 @@ def _whois_email(domain: str) -> str:
     return ""
 
 
-def _playwright_scrape(url: str, timeout: int = 15) -> str:
+def _is_js_spa(soup: BeautifulSoup) -> bool:
     """
-    Rend la page via Playwright (headless Chromium) et extrait les emails
-    du HTML rendu côté client (sites JavaScript).
+    Retourne True si la page ressemble à un site JavaScript non rendu :
+    - Présence d'une div container SPA (id=root/app/__nuxt/__next)
+    - OU texte visible < 500 caractères après nettoyage des espaces
+    """
+    for spa_id in ("root", "app", "__nuxt", "__next"):
+        if soup.find("div", id=spa_id):
+            return True
+    text = " ".join(soup.get_text().split())
+    return len(text) < 500
+
+
+def _playwright_scrape(urls: list[str], timeout: int = 15) -> str:
+    """
+    Rend les pages via Playwright (headless Chromium) et extrait le premier email trouvé.
+    Ouvre un seul browser pour toutes les URLs (efficace).
     Nécessite : pip install playwright && playwright install chromium
     """
     if not _PLAYWRIGHT_OK:
@@ -1173,15 +1215,22 @@ def _playwright_scrape(url: str, timeout: int = 15) -> str:
     try:
         with _sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(extra_http_headers=_BROWSER_HEADERS)
-            page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
-            html = page.content()
-            browser.close()
-        soup = BeautifulSoup(html, "html.parser")
-        found = _extract_emails_from_page(soup)
-        valid = [e for e in found if _is_valid_email(e)]
-        if valid:
-            return sorted(valid, key=_email_priority)[0]
+            try:
+                for url in urls:
+                    try:
+                        page = browser.new_page(extra_http_headers=_BROWSER_HEADERS)
+                        page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+                        html = page.content()
+                        page.close()
+                        soup  = BeautifulSoup(html, "html.parser")
+                        found = _extract_emails_from_page(soup, html)
+                        valid = [e for e in found if _is_valid_email(e)]
+                        if valid:
+                            return sorted(valid, key=_email_priority)[0]
+                    except Exception:
+                        continue
+            finally:
+                browser.close()
     except Exception:
         pass
     return ""
@@ -1371,6 +1420,9 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
     pages  = [url] + [urljoin(base, p) for p in _CONTACT_PATHS]
 
     # ── Étape 1 : sources fiables sur toutes les pages ────────────────────────
+    js_spa_detected = False
+    soups_for_fallback: list[BeautifulSoup] = []
+
     for page_url in pages:
         try:
             resp = requests.get(
@@ -1385,17 +1437,28 @@ def scrape_email_from_website(url: str, timeout: int = 8) -> str:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
-            found = _extract_emails_from_page(soup)
+            if page_url == url and _is_js_spa(soup):
+                js_spa_detected = True
+            found = _extract_emails_from_page(soup, resp.text)
             valid = [e for e in found if _is_valid_email(e)]
             if valid:
                 return sorted(valid, key=_email_priority)[0]
+            soups_for_fallback.append(soup)
 
         except requests.RequestException:
             continue
 
-    # ── Étape 2 : Playwright (rendu JS) ──────────────────────────────────────
-    if _PLAYWRIGHT_OK:
-        pw_email = _playwright_scrape(url, timeout=15)
+    # ── Étape 1b : fallback texte visible (emails non structurés) ─────────────
+    for soup in soups_for_fallback:
+        found = _extract_emails_from_visible_text(soup)
+        valid = [e for e in found if _is_valid_email(e)]
+        if valid:
+            return sorted(valid, key=_email_priority)[0]
+
+    # ── Étape 2 : Playwright — seulement si SPA détecté ─────────────────────
+    if _PLAYWRIGHT_OK and js_spa_detected:
+        contact_url = urljoin(base, "/contact")
+        pw_email = _playwright_scrape([url, contact_url], timeout=15)
         if pw_email:
             return pw_email
 
