@@ -1742,6 +1742,84 @@ class GooglePlacesScraper:
         return output.getvalue().encode("utf-8-sig")
 
 
+# ── Blacklist grandes chaînes / franchises ─────────────────────────────────────
+# Noms normalisés (minuscules, sans accents) des enseignes à exclure
+
+CHAIN_BLACKLIST: frozenset[str] = frozenset({
+    # Fast-food internationaux
+    "mcdonalds", "mcdonald's", "mcdonald", "mac donald", "mac do",
+    "burger king", "burgerking",
+    "kfc", "kentucky fried chicken",
+    "subway",
+    "dominos", "domino's", "domino's pizza",
+    "pizza hut", "pizzahut",
+    "five guys",
+    "taco bell", "tacobell",
+    "quick",
+    "chicken republic",
+    "buffalo grill", "buffalogrill",
+    "courtepaille",
+    "hippopotamus",
+    "flunch",
+    "brioche doree", "brioche dorée",
+    "paul",
+    "eric kayser",
+    "exki",
+    # Chaînes café/snack
+    "starbucks",
+    "columbus cafe", "columbus café", "columbus coffee",
+    "costa coffee",
+    "cafe de flore",  # célèbre mais independant — gardé pour sécurité
+    "mcdonald",
+    # Chaînes beauté/spa
+    "franck provost",
+    "jean louis david", "jean-louis david",
+    "dessange",
+    "hair coif", "haircoiff", "hair coiff",
+    "saint algue", "saint-algue",
+    "camille albane",
+    "tchip",
+    "coiff and co", "coiff & co", "coiff&co",
+    "great clips",
+    "supercuts",
+    "toni and guy", "toni&guy",
+    "l'occitane",
+    "yves rocher",
+    "body shop", "the body shop",
+    "sephora",
+    "nocibe", "nocibé",
+    "marionnaud",
+    # Chaînes hôtels (si secteur hôtellerie)
+    "ibis", "novotel", "mercure", "sofitel", "pullman", "accorhotels",
+    "campanile", "kyriad", "premiere classe", "première classe",
+    "best western",
+    "holiday inn",
+    "hilton", "marriott", "sheraton", "radisson",
+    "formule 1", "f1 hotel",
+    "b&b hotel", "b and b hotel",
+    # Chaînes fitness
+    "fitness park", "fitnesspark",
+    "basic fit", "basic-fit",
+    "l'appart fitness",
+    "keep cool",
+    "neoness",
+    "club med gym",
+    "orange bleue",
+})
+
+
+def _is_chain(name: str) -> bool:
+    """Retourne True si le nom correspond à une grande chaîne/franchise."""
+    normalized = unicodedata.normalize("NFD", name.lower()).encode("ascii", "ignore").decode()
+    # Vérification exacte ou si le nom commence par un mot de la blacklist
+    if normalized in CHAIN_BLACKLIST:
+        return True
+    for chain in CHAIN_BLACKLIST:
+        if normalized.startswith(chain + " ") or normalized.startswith(chain + "-"):
+            return True
+    return False
+
+
 # ── Collecteur massif ──────────────────────────────────────────────────────────
 
 class MassiveCollector:
@@ -1905,6 +1983,10 @@ class MassiveCollector:
                 pid = place.get("id")
                 if not pid:
                     continue
+                # Exclure les grandes chaînes / franchises
+                place_name = place.get("displayName", {}).get("text", "")
+                if _is_chain(place_name):
+                    continue
                 with self._lock:
                     if pid in self._seen_ids:
                         continue
@@ -2039,10 +2121,13 @@ class MassiveCollector:
         total = len(combinations)
         self._update_state(is_running=True, total_combinations=total)
 
+        last_done = 0  # suivi du nombre réel de combinaisons traitées
+
         for i, (city, dept, dept_name, sector_key, btype) in enumerate(combinations):
             if self.stop_event.is_set():
                 break
 
+            last_done = i
             self._update_state(
                 current_task=f"{city} ({dept}) — {btype}",
                 progress=i / total if total else 0.0,
@@ -2089,11 +2174,12 @@ class MassiveCollector:
             time.sleep(0.5)  # Pause courtoise entre les appels Google
 
         # ── Fin de la boucle ──────────────────────────────────────────────────
+        stopped = self.stop_event.is_set()
         self._update_state(
             is_running=False,
-            is_done=not self.stop_event.is_set(),
-            progress=1.0,
-            done_combinations=total,
+            is_done=not stopped,
+            progress=1.0 if not stopped else (last_done / total if total else 0.0),
+            done_combinations=total if not stopped else last_done,
         )
 
 
